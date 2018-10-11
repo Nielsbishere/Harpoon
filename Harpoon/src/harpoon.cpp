@@ -80,7 +80,10 @@ LPVOID allocBuffer(HANDLE process, void *start, DWORD length, bool exec) {
 	LPVOID remote = VirtualAllocEx(process, NULL, length, MEM_COMMIT | MEM_RESERVE, exec ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE);
 	check(remote, "Couldn't allocate space into process");
 	check(WriteProcessMemory(process, remote, (LPVOID)start, length, NULL), "Couldn't write buffer into memory");
-
+	
+	DWORD oldProtection;
+	check(VirtualProtectEx(process, remote, length, exec ? PAGE_EXECUTE_READ : PAGE_READONLY, &oldProtection), "Couldn't make page non-writable");
+	
 	return remote;
 }
 
