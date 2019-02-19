@@ -6,3 +6,8 @@
 Harpoon/x64/
 HarpoonLoader/x64/
 Harpoon.Core/obj/Release/
+bin/
+Harpoon/Debug/
+HarpoonLoader/Debug/
+Harpoon.Core/obj/
+HarpoonLoader/Release/

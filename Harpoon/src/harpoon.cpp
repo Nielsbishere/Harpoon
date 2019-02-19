@@ -96,7 +96,7 @@ struct CopyDll {
 
 };
 
-CopyDll loadCopyDll(const char *path, HANDLE process) {
+CopyDll loadCopyDll(const char *path, HANDLE process, bool copyToProcess = true) {
 
 	//Load library into our memory
 	HINSTANCE loc = LoadLibraryA(path);
@@ -107,7 +107,7 @@ CopyDll loadCopyDll(const char *path, HANDLE process) {
 	MODULEINFO info;
 	check(GetModuleInformation(GetCurrentProcess(), loc, &info, (DWORD) sizeof(info)), "Couldn't get module info");
 
-	return { loc, (size_t)info.SizeOfImage, allocBuffer(process, loc, info.SizeOfImage, true) };
+	return { loc, (size_t)info.SizeOfImage, !copyToProcess ? nullptr : allocBuffer(process, loc, info.SizeOfImage, true) };
 }
 
 PVOID getRemoteFunc(CopyDll dll, const char *func) {
@@ -130,6 +130,9 @@ struct RemoteDll {
 
 RemoteDll getRemoteDll(HANDLE process, std::string module) {
 
+	for (char &c : module)
+		c = toupper(c);
+
 	HINSTANCE handles[2048];
 	DWORD needed = 0;
 	EnumProcessModulesEx(process, handles, sizeof(handles), &needed, LIST_MODULES_ALL);
@@ -144,7 +147,16 @@ RemoteDll getRemoteDll(HANDLE process, std::string module) {
 		MODULEINFO modInfo;
 		GetModuleInformation(process, handles[i], &modInfo, sizeof(modInfo));
 
-		if (module == name)
+		std::string mname = name;
+
+		for (char &c : mname)
+			c = toupper(c);
+
+		#ifdef _DEBUG
+			printf("%s\n", mname);
+		#endif
+
+		if (module == mname)
 			return { name, fileName, handles[i] };
 
 	}
@@ -160,25 +172,32 @@ RemoteDll getRemoteDll(HANDLE process, std::string module) {
 #define padptr "\0\0\0\0"
 #endif
 
-std::unordered_map<std::string, void*> getFunctions(RemoteDll dll, std::vector<std::string> functions) {
+void getFunctions(RemoteDll dll, std::vector<std::string> functions, std::unordered_map<std::string, void*> &funcs) {
 
 	HINSTANCE local = LoadLibraryExA(dll.fileName.c_str(), NULL, DONT_RESOLVE_DLL_REFERENCES);
 	if (local == NULL) {
 		printf("Couldn't load remote library\n");
-		return {};
+		return;
 	}
 
-	std::unordered_map<std::string, void*> funcs;
+	funcs.clear();
 
-	for (std::string &str : functions)
-		funcs[str] = (void*)((char*)GetProcAddress(local, str.c_str()) - (char*)local + (char*)dll.remote);
+	for (std::string &str : functions) {
+
+		char *addr = (char*)GetProcAddress(local, str.c_str());
+
+		if (addr == nullptr)
+			continue;
+
+		funcs[str] = (void*)(addr - (char*)local + (char*)dll.remote);
+	}
 
 	FreeLibrary(local);
-	return funcs;
+	return;
 
 }
 
-void Harpoon::hook(DWORD processId, std::string dllPath) {
+void Harpoon::hook(DWORD processId, std::string dllPath, std::string dllName) {
 
 	//Get process
 
@@ -202,56 +221,134 @@ void Harpoon::hook(DWORD processId, std::string dllPath) {
 
 	//TODO: check is64bit
 
-	//Load our dll into the host's process and mono into our process
-	CopyDll harpoon = loadCopyDll(dllPath.c_str(), process);
-	RemoteDll mono = getRemoteDll(process, "mono.dll");
+	#ifdef REFLECTIVE_INJECTION
 
-	//Setup a command to get our functions from DLL
-	std::vector<std::string> funcs = {
-		"mono_domain_get",
-		"mono_thread_attach",
-		"mono_get_root_domain",
-		"mono_domain_assembly_open",
-		"mono_class_from_name",
-		"mono_class_get_method_from_name",
-		"mono_runtime_invoke",
-		"mono_assembly_get_image"
-	};
+		//Load our dll into the host's process
+		CopyDll harpoon = loadCopyDll(dllPath.c_str(), process);
 
-	auto functionMap = getFunctions(mono, funcs);
+	#endif
 
-	//These are our strings (and functions); but we can't use those directly
-	//This is because this program will be moved and any address (not to kernel32) will have to be moved
-	char data[] = {
-		"Harpoon.Core\0"						//0
-		"HarpoonCore\0"							//13
-		"Initialize\0"							//25
-		"Harpoon.Core.dll\0"					//36
-		padptr									//53;	fmono_domain_get
-		padptr									//		fmono_thread_attach
-		padptr									//		fmono_get_root_domain
-		padptr									//		fmono_domain_assembly_open
-		padptr									//		fmono_class_from_name
-		padptr									//		fmono_class_get_method_from_name
-		padptr									//		fmono_runtime_invoke
-		padptr									//		fmono_assembly_get_image
-	};
+	#ifdef CSHARP_MONO
 
-	constexpr size_t pad = sizeof(void*);
+		RemoteDll mono = getRemoteDll(process, "mono.dll");
 
-	*(void**)(data + 53) = functionMap["mono_domain_get"];
-	*(void**)(data + 53 + pad) = functionMap["mono_thread_attach"];
-	*(void**)(data + 53 + pad * 2) = functionMap["mono_get_root_domain"];
-	*(void**)(data + 53 + pad * 3) = functionMap["mono_domain_assembly_open"];
-	*(void**)(data + 53 + pad * 4) = functionMap["mono_class_from_name"];
-	*(void**)(data + 53 + pad * 5) = functionMap["mono_class_get_method_from_name"];
-	*(void**)(data + 53 + pad * 6) = functionMap["mono_runtime_invoke"];
-	*(void**)(data + 53 + pad * 7) = functionMap["mono_assembly_get_image"];;
+		//Setup a command to get our functions from DLL
+		std::vector<std::string> funcs = {
+			"mono_domain_get",
+			"mono_thread_attach",
+			"mono_get_root_domain",
+			"mono_domain_assembly_open",
+			"mono_class_from_name",
+			"mono_class_get_method_from_name",
+			"mono_runtime_invoke",
+			"mono_assembly_get_image"
+		};
+
+		std::unordered_map<std::string, void*> functionMap;
+		getFunctions(mono, funcs, functionMap);
+
+		check(functionMap.size() == funcs.size(), "Couldn't get functions from dll");
+
+		//These are our strings (and functions); but we can't use those directly
+		//This is because this program will be moved and any address (not to kernel32) will have to be moved
+		char data[] = {
+			"Harpoon.Core\0"						//0
+			"HarpoonCore\0"							//13
+			"Initialize\0"							//25
+			"Harpoon.Core.dll\0"					//36
+			padptr									//53;	fmono_domain_get
+			padptr									//		fmono_thread_attach
+			padptr									//		fmono_get_root_domain
+			padptr									//		fmono_domain_assembly_open
+			padptr									//		fmono_class_from_name
+			padptr									//		fmono_class_get_method_from_name
+			padptr									//		fmono_runtime_invoke
+			padptr									//		fmono_assembly_get_image
+		};
+
+		constexpr size_t pad = sizeof(void*);
+
+		*(void**)(data + 53) = functionMap["mono_domain_get"];
+		*(void**)(data + 53 + pad) = functionMap["mono_thread_attach"];
+		*(void**)(data + 53 + pad * 2) = functionMap["mono_get_root_domain"];
+		*(void**)(data + 53 + pad * 3) = functionMap["mono_domain_assembly_open"];
+		*(void**)(data + 53 + pad * 4) = functionMap["mono_class_from_name"];
+		*(void**)(data + 53 + pad * 5) = functionMap["mono_class_get_method_from_name"];
+		*(void**)(data + 53 + pad * 6) = functionMap["mono_runtime_invoke"];
+		*(void**)(data + 53 + pad * 7) = functionMap["mono_assembly_get_image"];;
+
+	#else
+
+		char data[] = {
+			padptr
+		};
+
+		RemoteDll kernel32 = getRemoteDll(process, "Kernel32.dll");
+
+		std::vector<std::string> funcs = {
+			"AllocConsole"
+		};
+
+		std::unordered_map<std::string, void*> functionMap;
+		getFunctions(kernel32, funcs, functionMap);
+
+		check(functionMap.size() == funcs.size(), "Couldn't get functions from dll");
+
+		*(void**)data = functionMap["AllocConsole"];
+
+	#endif
+
+	//Add required function pointers
 
 	LPVOID dat = allocBuffer(process, data, (DWORD) sizeof(data), false);
 
+	//Get initialize function
+
+	#ifdef REFLECTIVE_INJECTION
+	
+		//Get injected initialize function
+
+		PTHREAD_START_ROUTINE initialize = (PTHREAD_START_ROUTINE)getRemoteFunc(harpoon, "initialize");
+
+	#else
+
+		//Add lib name onto process's heap
+
+		LPVOID libName = allocBuffer(process, (void*)dllPath.c_str(), dllPath.size() + 1, false);
+
+		//LoadLibrary is located in kernel32 (which is always located at the same place)
+
+		LPTHREAD_START_ROUTINE loadLibrary = (LPTHREAD_START_ROUTINE) GetProcAddress(GetModuleHandleA("kernel32"), "LoadLibraryA");
+		check(loadLibrary, "Couldn't get load library address");
+
+		//Run loadLibrary with our libName
+
+		HANDLE loadLib = CreateRemoteThread(process, NULL, 0, loadLibrary, libName, 0, NULL);
+		check(loadLib, "Couldn't load library into process");
+
+		//Wait for it to finish and clean up
+
+		WaitForSingleObject(loadLib, INFINITE);
+		VirtualFreeEx(process, libName, 0, MEM_RELEASE);
+		CloseHandle(loadLib);
+
+		//Get function from remote DLL
+
+		RemoteDll harpoon = getRemoteDll(process, dllName);
+
+		funcs = {
+			"initialize"
+		};
+
+		getFunctions(harpoon, funcs, functionMap);
+
+		check(functionMap.size() == funcs.size(), "Couldn't get functions from dll");
+
+		PTHREAD_START_ROUTINE initialize = (PTHREAD_START_ROUTINE) functionMap["initialize"];
+
+	#endif
+
 	//Run our remote function
-	PTHREAD_START_ROUTINE initialize = (PTHREAD_START_ROUTINE) getRemoteFunc(harpoon, "initialize");
 	printf("Running %s::initialize at %p\n", dllPath.c_str(), (void*)initialize);
 
 	HANDLE thread = CreateRemoteThread(process, NULL, 0, initialize, dat, 0, NULL);
@@ -261,9 +358,13 @@ void Harpoon::hook(DWORD processId, std::string dllPath) {
 	WaitForSingleObject(thread, INFINITE);
 
 	VirtualFreeEx(process, dat, 0, MEM_RELEASE);
-	VirtualFreeEx(process, harpoon.remote, 0, MEM_RELEASE);
+
+	#ifdef REFLECTIVE_INJECTION
+		VirtualFreeEx(process, harpoon.remote, 0, MEM_RELEASE);
+		FreeLibrary(harpoon.current);
+	#endif
+
 	CloseHandle(thread);
-	FreeLibrary(harpoon.current);
 
 	CloseHandle(process);
 
@@ -309,7 +410,7 @@ int main(int argc, char *argv[]) {
 
 		if (id == 0) return help("Syntax: -hookid <pId> <dllPath>", false);
 
-		Harpoon::hook((DWORD)id, dll);
+		Harpoon::hook((DWORD)id, dll, std::string(argv[3]) + ".dll");
 		return 1;
 	}
 	else if (arg == "-hook") {
@@ -328,7 +429,7 @@ int main(int argc, char *argv[]) {
 
 		printf("Resolved %s as %u\n", pid.c_str(), id);
 
-		Harpoon::hook(id, dll);
+		Harpoon::hook(id, dll, std::string(argv[3]) + ".dll");
 		return 1;
 	}
 
